@@ -676,3 +676,10 @@ void eventer_jobq_process_each(void (*func)(eventer_jobq_t *, void *),
 void eventer_jobq_init_globals() {
   mtev_hash_init(&all_queues);
 }
+
+const char *eventer_jobq_get_queue_name(eventer_jobq_t *jobq) {
+  return jobq->queue_name;
+}
+uint32_t eventer_jobq_get_concurrency(eventer_jobq_t *jobq) {
+  return jobq->concurrency;
+}
