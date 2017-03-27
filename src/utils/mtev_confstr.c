@@ -318,7 +318,7 @@ mtevL(mtev_stderr, "ERR %d\n", __LINE__);
       return MTEV_CONFSTR_PARSE_ERR_FORMAT;
   }
   if(*input) {
-mtevL(mtev_stderr, "ERR %d\n", __LINE__);
+mtevL(mtev_stderr, "ERR %d '%s'\n", __LINE__, input);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
   }
 
