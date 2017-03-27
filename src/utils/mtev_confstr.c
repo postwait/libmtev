@@ -257,6 +257,7 @@ mtev_timegm(struct tm *t)
 int
 mtev_confstr_parse_time_gm(const char *input, uint64_t *output)
 {
+  const char *orig = input;
   char *iter;
   char tzchr;
   int64_t base_time;
@@ -267,7 +268,7 @@ mtev_confstr_parse_time_gm(const char *input, uint64_t *output)
   struct tm construct_date;
   struct tm construct_time;
   struct tm construct_tzoffs;
-mtevL(mtev_stderr, "mtev_confstr_parse_time_gm('%s', ...)\n", input);
+mtevL(mtev_stderr, "mtev_confstr_parse_time_gm(%p/'%s', ...)\n", input, input);
 
   iter = strptime(input, "%Y-%m-%d", &construct_date);
   if(! iter || toupper(*iter) != 'T') {
@@ -318,7 +319,7 @@ mtevL(mtev_stderr, "ERR %d\n", __LINE__);
       return MTEV_CONFSTR_PARSE_ERR_FORMAT;
   }
   if(*input) {
-mtevL(mtev_stderr, "ERR %d '%s'\n", __LINE__, input);
+mtevL(mtev_stderr, "ERR %d (org:%s) %p/'%s'\n", __LINE__, orig, input, input);
     mtevAssert(0);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
   }
