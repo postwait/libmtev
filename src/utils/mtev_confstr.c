@@ -1,4 +1,5 @@
 #include "mtev_confstr.h"
+#include "mtev_log.h"
 #include <time.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -266,20 +267,29 @@ mtev_confstr_parse_time_gm(const char *input, uint64_t *output)
   struct tm construct_date;
   struct tm construct_time;
   struct tm construct_tzoffs;
+mtevL(mtev_stderr, "mtev_confstr_parse_time_gm('%s', ...)\n", input);
 
   iter = strptime(input, "%Y-%m-%d", &construct_date);
-  if(! iter || toupper(*iter) != 'T')
+  if(! iter || toupper(*iter) != 'T') {
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
+  }
 
-  if(! is_valid_date(construct_date.tm_year, construct_date.tm_mon, construct_date.tm_mday))
+  if(! is_valid_date(construct_date.tm_year, construct_date.tm_mon, construct_date.tm_mday)) {
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
+  }
 
   input = iter+1;
   iter = strptime(input, "%T", &construct_time);
-  if(! iter)
+  if(! iter) {
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
-  if(! is_valid_time(construct_time.tm_hour, construct_time.tm_min, construct_time.tm_sec))
+  }
+  if(! is_valid_time(construct_time.tm_hour, construct_time.tm_min, construct_time.tm_sec)) {
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
+  }
 
   tzchr = *iter;
   input = iter+1;
@@ -291,8 +301,10 @@ mtev_confstr_parse_time_gm(const char *input, uint64_t *output)
       if(! iter)
         return MTEV_CONFSTR_PARSE_ERR_FORMAT;
 
-      if(! is_valid_time(construct_tzoffs.tm_hour, construct_tzoffs.tm_min, 0))
+      if(! is_valid_time(construct_tzoffs.tm_hour, construct_tzoffs.tm_min, 0)) {
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
         return MTEV_CONFSTR_PARSE_ERR_FORMAT;
+}
       input = iter+1;
       tz_offset = (construct_tzoffs.tm_hour * 60 + construct_tzoffs.tm_min) * 60;
       if(tzchr == '-')
@@ -302,10 +314,13 @@ mtev_confstr_parse_time_gm(const char *input, uint64_t *output)
     case 'Z':
       break;
     default:
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
       return MTEV_CONFSTR_PARSE_ERR_FORMAT;
   }
-  if(*input)
+  if(*input) {
+mtevL(mtev_stderr, "ERR %d\n", __LINE__);
     return MTEV_CONFSTR_PARSE_ERR_FORMAT;
+  }
 
   construct_date.tm_hour = construct_time.tm_hour;
   construct_date.tm_min = construct_time.tm_min;
