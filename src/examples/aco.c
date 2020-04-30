@@ -21,6 +21,7 @@
 
 #define APPNAME "example1"
 #define CLUSTER_NAME "ponies"
+static mtev_log_stream_t testing;
 static char *config_file = NULL;
 static int debug = 0;
 static int foreground = 0;
@@ -75,6 +76,11 @@ static void asynch_hello(void *closure) {
   mtev_http_rest_closure_t *restc = closure;
   mtev_http_session_ctx *ctx = restc->http_ctx;
   usleep(100);
+  for(int i=0; i<10000000; i++) {
+    mtevEL(testing, MLKV{ MLKV_NUM("ecidm", i%1000000), MLKV_NUM("errno", errno),
+           MLKV_STR("string", "with a value"), MLKV_END },
+           "This is the ecid:%d, ecidm:%d, errno:%d, '%s'\n", i, (i%1000), errno, "with a value");
+  }
   mtev_http_response_append_str(ctx, "Hello world.\n");
 }
 
@@ -234,7 +240,7 @@ child_main(void) {
     exit(2);
   }
   eventer_init();
-
+  testing = mtev_log_stream_find("testing");
   mtev_listener_register_aco_function("listen_to_me", listen_to_me);
 
   mtev_dso_init();
