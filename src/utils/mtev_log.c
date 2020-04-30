@@ -48,6 +48,7 @@
 #include <dirent.h>
 #endif
 #include <ck_pr.h>
+#include <ck_rwlock.h>
 #include <ck_fifo.h>
 
 #define mtev_log_impl
@@ -84,6 +85,7 @@ static pthread_mutex_t resize_lock;
 static int min_flush_seconds = ((MTEV_LOG_DEFAULT_DEDUP_S-1) / 2) + 1;
 static mtev_logic_exec_t *filter_runtime;
 static stats_ns_t *mtev_log_lines_stats_ns;
+ck_rwlock_recursive_t outlets_lock = CK_RWLOCK_RECURSIVE_INITIALIZER;
 
 MTEV_HOOK_IMPL(mtev_log_plain,
                (mtev_log_stream_t ls, const struct timeval *whence,
@@ -440,12 +442,14 @@ static mtev_boolean has_material_output(mtev_log_stream_t ls) {
     goto ret;
   }
 
+  ck_rwlock_recursive_read_lock(&outlets_lock);
   for(node = ls->outlets; node; node = node->next) {
     if(has_material_output(node->outlet)) {
       state = mtev_true;
-      goto ret;
+      break;
     }
   }
+  ck_rwlock_recursive_read_unlock(&outlets_lock);
 
  ret:
   debug_printf("has_material_output(%s) -> %s\n", ls->name, state ? "true" : "false");
@@ -509,7 +513,9 @@ mtev_log_materialize(void) {
 static void
 mtev_log_rematerialize(void) {
   mtev_log_dematerialize();
+  ck_rwlock_recursive_read_lock(&outlets_lock);
   mtev_log_materialize();
+  ck_rwlock_recursive_read_unlock(&outlets_lock);
 }
 
 
@@ -1718,9 +1724,11 @@ mtev_log_stream_remove(const char *name) {
 void
 mtev_log_stream_add_stream(mtev_log_stream_t ls, mtev_log_stream_t outlet) {
   struct _mtev_log_stream_outlet_list *newnode;
+  ck_rwlock_recursive_write_lock(&outlets_lock, mtev_thread_id());
   for(newnode = ls->outlets; newnode; newnode = newnode->next) {
     if(!strcmp(newnode->outlet->name, outlet->name)) {
       mtevAssert(outlet == newnode->outlet);
+      ck_rwlock_recursive_write_unlock(&outlets_lock);
       return;
     }
   }
@@ -1728,6 +1736,7 @@ mtev_log_stream_add_stream(mtev_log_stream_t ls, mtev_log_stream_t outlet) {
   newnode->outlet = outlet;
   newnode->next = ls->outlets;
   ls->outlets = newnode;
+  ck_rwlock_recursive_write_unlock(&outlets_lock);
   mtev_log_rematerialize();
   return;
 }
@@ -1735,22 +1744,110 @@ mtev_log_stream_add_stream(mtev_log_stream_t ls, mtev_log_stream_t outlet) {
 static mtev_boolean
 mtev_log_filter_exec(void *closure, mtev_LogLine_fb_t ll) {
   mtev_logic_ast_t *ast = closure;
+  if(!filter_runtime) return mtev_false;
   return mtev_logic_exec(filter_runtime, ast, ll);
 }
+
+static mtev_boolean
+flatbuffer_log_logic_lookup(void *closure, const char *name, mtev_logic_var_t *out) {
+  if(closure == NULL) return mtev_false;
+  mtev_LogLine_table_t ll = (mtev_LogLine_table_t)closure;
+  mtev_KVPair_vec_t kvs = mtev_LogLine_kv(ll);
+  int nelem = 0;
+  int nkvs = mtev_KVPair_vec_len(kvs);
+  struct timeval whence;
+  whence.tv_sec = mtev_LogLine_timestamp(ll) / 1000000;
+  whence.tv_usec = mtev_LogLine_timestamp(ll) % 1000000;
+  if(!strcmp(name,"timestamp")) {
+    mtev_logic_var_set_double(out, (double)whence.tv_sec + (double)whence.tv_usec / 1000000.0);
+    return mtev_true;
+  }
+  else if(!strcmp(name,"facility")) {
+    mtev_logic_var_set_string(out, mtev_LogLine_facility(ll));
+    return mtev_true;
+  }
+  else if(!strcmp(name,"threadid")) {
+    mtev_logic_var_set_int64(out, mtev_LogLine_threadid(ll));
+    return mtev_true;
+  }
+  else if(!strcmp(name,"threadname")) {
+    if(!mtev_LogLine_threadname_is_present(ll)) return mtev_false;
+    flatbuffers_string_t tname = mtev_LogLine_threadname(ll);
+    mtev_logic_var_set_string(out, flatbuffers_string_len(tname) ? mtev_LogLine_threadname(ll) : "unknown");
+    return mtev_true;
+  }
+  else if(!strcmp(name,"file")) {
+    mtev_logic_var_set_string(out, mtev_LogLine_file(ll));
+    return mtev_true;
+  }
+  else if(!strcmp(name,"line")) {
+    mtev_logic_var_set_int64(out, mtev_LogLine_line(ll));
+    return mtev_true;
+  }
+  else if(!strcmp(name,"message")) {
+    mtev_logic_var_set_string(out, mtev_LogLine_message(ll));
+    return mtev_true;
+  }
+  else {
+    uint64_t v;
+    for(int i=0; i<nkvs; i++) {
+      mtev_KVPair_table_t kv = mtev_KVPair_vec_at(kvs, i);
+      if(!strcmp(name, mtev_KVPair_key(kv))) {
+        const unsigned char *uuid;
+        char uuid_str[UUID_STR_LEN + 1];
+        switch(mtev_KVPair_value_type(kv)) {
+          case mtev_Value_UUIDValue:
+            uuid = mtev_UUIDValue_value(mtev_KVPair_value(kv));
+            if(!uuid) return mtev_false;
+            mtev_uuid_unparse_lower(uuid, uuid_str);
+            mtev_logic_var_set_string_copy(out, uuid_str);
+            return mtev_true;
+          case mtev_Value_StringValue:
+            mtev_logic_var_set_string(out, mtev_StringValue_value(mtev_KVPair_value(kv)));
+            return mtev_true;
+          case mtev_Value_LongValue:
+            mtev_logic_var_set_int64(out, mtev_LongValue_value(mtev_KVPair_value(kv)));
+            return mtev_true;
+          case mtev_Value_ULongValue:
+            v = mtev_ULongValue_value(mtev_KVPair_value(kv));
+            if(v <= INT64_MAX) mtev_logic_var_set_int64(out, v);
+            else mtev_logic_var_set_double(out, (double)v);
+            return mtev_true;
+          case mtev_Value_DoubleValue:
+            mtev_logic_var_set_double(out, mtev_DoubleValue_value(mtev_KVPair_value(kv)));
+            return mtev_true;
+          default:
+            break;
+        }
+        return mtev_false;
+      }
+    }
+  }
+  return mtev_false;
+}
+static mtev_logic_ops_t flatbuffer_log_filter_ops = {
+  .lookup = flatbuffer_log_logic_lookup
+};
 
 mtev_boolean
 mtev_log_stream_add_stream_filtered(mtev_log_stream_t ls, mtev_log_stream_t outlet,
                                     const char *filter) {
   struct _mtev_log_stream_outlet_list *newnode;
+
+  if(!filter_runtime) filter_runtime = mtev_logic_exec_alloc(&flatbuffer_log_filter_ops);
+
+  ck_rwlock_recursive_write_lock(&outlets_lock, mtev_thread_id());
   for(newnode = ls->outlets; newnode; newnode = newnode->next) {
     if(!strcmp(newnode->outlet->name, outlet->name)) {
       mtevAssert(outlet == newnode->outlet);
+      ck_rwlock_recursive_write_unlock(&outlets_lock);
       return mtev_false;
     }
   }
   char *error;
   mtev_logic_ast_t *ast = mtev_logic_parse(filter, &error);
   if(!ast) {
+    ck_rwlock_recursive_write_unlock(&outlets_lock);
     mtevL(outlet, "error attaching filtered stream (%s): %s\n", filter, error);
     return mtev_false;
   }
@@ -1761,6 +1858,7 @@ mtev_log_stream_add_stream_filtered(mtev_log_stream_t ls, mtev_log_stream_t outl
   newnode->outlet = outlet;
   newnode->next = ls->outlets;
   ls->outlets = newnode;
+  ck_rwlock_recursive_write_unlock(&outlets_lock);
   mtev_log_rematerialize();
   return mtev_true;
 }
@@ -1769,11 +1867,13 @@ void
 mtev_log_stream_removeall_streams(mtev_log_stream_t ls) {
   struct _mtev_log_stream_outlet_list *tofree;
   if(ls->outlets == NULL) return;
+  ck_rwlock_recursive_write_lock(&outlets_lock, mtev_thread_id());
   while(NULL != (tofree = ls->outlets)) {
     ls->outlets = ls->outlets->next;
     if(tofree->filter_free) tofree->filter_free(tofree->filter_closure);
     free(tofree);
   }
+  ck_rwlock_recursive_write_unlock(&outlets_lock);
   mtev_log_rematerialize();
 }
 
@@ -1782,12 +1882,14 @@ mtev_log_stream_remove_stream(mtev_log_stream_t ls, const char *name) {
   mtev_log_stream_t outlet;
   struct _mtev_log_stream_outlet_list *node, *tmp;
   if(!ls->outlets) return NULL;
+  ck_rwlock_recursive_write_lock(&outlets_lock, mtev_thread_id());
   if(!strcmp(ls->outlets->outlet->name, name)) {
     node = ls->outlets;
     ls->outlets = node->next;
     outlet = node->outlet;
     if(node->filter_free) node->filter_free(node->filter_closure);
     free(node);
+    ck_rwlock_recursive_write_unlock(&outlets_lock);
     mtev_log_rematerialize();
     return outlet;
   }
@@ -1801,19 +1903,26 @@ mtev_log_stream_remove_stream(mtev_log_stream_t ls, const char *name) {
       /* shed */
       free(tmp);
       /* return */
+      ck_rwlock_recursive_write_unlock(&outlets_lock);
       mtev_log_rematerialize();
       return outlet;
     }
   }
+  ck_rwlock_recursive_write_unlock(&outlets_lock);
   return NULL;
 }
 
-void mtev_log_stream_reopen(mtev_log_stream_t ls) {
+static void mtev_log_stream_reopen_locked(mtev_log_stream_t ls) {
   struct _mtev_log_stream_outlet_list *node;
   if(ls->ops && ls->ops->reopenop) ls->ops->reopenop(ls);
   for(node = ls->outlets; node; node = node->next) {
-    mtev_log_stream_reopen(node->outlet);
+    mtev_log_stream_reopen_locked(node->outlet);
   }
+}
+void mtev_log_stream_reopen(mtev_log_stream_t ls) {
+  ck_rwlock_recursive_read_lock(&outlets_lock);
+  mtev_log_stream_reopen_locked(ls);
+  ck_rwlock_recursive_read_unlock(&outlets_lock);
 }
 
 int mtev_log_stream_rename(mtev_log_stream_t ls, const char *newname) {
@@ -1847,11 +1956,13 @@ mtev_log_stream_free(mtev_log_stream_t ls) {
     if(ls->name) free(ls->name);
     if(ls->path) free(ls->path);
     if(ls->type) free(ls->type);
+    ck_rwlock_recursive_write_lock(&outlets_lock, mtev_thread_id());
     while(ls->outlets) {
       node = ls->outlets->next;
       free(ls->outlets);
       ls->outlets = node;
     }
+    ck_rwlock_recursive_write_unlock(&outlets_lock);
     if(ls->config) {
       mtev_hash_destroy(ls->config, free, free);
       free(ls->config);
@@ -2001,87 +2112,6 @@ mtev_log_flatbuffer_to_json(mtev_LogLine_fb_t vll, mtev_dyn_buffer_t *tgt) {
   mtev_dyn_buffer_add(tgt, (uint8_t *)"}\n", 2);
 }
 
-static mtev_boolean
-flatbuffer_log_logic_lookup(void *closure, const char *name, mtev_logic_var_t *out) {
-  if(closure == NULL) return mtev_false;
-  mtev_LogLine_table_t ll = (mtev_LogLine_table_t)closure;
-  mtev_KVPair_vec_t kvs = mtev_LogLine_kv(ll);
-  int nelem = 0;
-  int nkvs = mtev_KVPair_vec_len(kvs);
-  struct timeval whence;
-  whence.tv_sec = mtev_LogLine_timestamp(ll) / 1000000;
-  whence.tv_usec = mtev_LogLine_timestamp(ll) % 1000000;
-  if(!strcmp(name,"timestamp")) {
-    mtev_logic_var_set_double(out, (double)whence.tv_sec + (double)whence.tv_usec / 1000000.0);
-    return mtev_true;
-  }
-  else if(!strcmp(name,"facility")) {
-    mtev_logic_var_set_string(out, mtev_LogLine_facility(ll));
-    return mtev_true;
-  }
-  else if(!strcmp(name,"threadid")) {
-    mtev_logic_var_set_int64(out, mtev_LogLine_threadid(ll));
-    return mtev_true;
-  }
-  else if(!strcmp(name,"threadname")) {
-    if(!mtev_LogLine_threadname_is_present(ll)) return mtev_false;
-    flatbuffers_string_t tname = mtev_LogLine_threadname(ll);
-    mtev_logic_var_set_string(out, flatbuffers_string_len(tname) ? mtev_LogLine_threadname(ll) : "unknown");
-    return mtev_true;
-  }
-  else if(!strcmp(name,"file")) {
-    mtev_logic_var_set_string(out, mtev_LogLine_file(ll));
-    return mtev_true;
-  }
-  else if(!strcmp(name,"line")) {
-    mtev_logic_var_set_int64(out, mtev_LogLine_line(ll));
-    return mtev_true;
-  }
-  else if(!strcmp(name,"message")) {
-    mtev_logic_var_set_string(out, mtev_LogLine_message(ll));
-    return mtev_true;
-  }
-  else {
-    uint64_t v;
-    for(int i=0; i<nkvs; i++) {
-      mtev_KVPair_table_t kv = mtev_KVPair_vec_at(kvs, i);
-      if(!strcmp(name, mtev_KVPair_key(kv))) {
-        const unsigned char *uuid;
-        char uuid_str[UUID_STR_LEN + 1];
-        switch(mtev_KVPair_value_type(kv)) {
-          case mtev_Value_UUIDValue:
-            uuid = mtev_UUIDValue_value(mtev_KVPair_value(kv));
-            if(!uuid) return mtev_false;
-            mtev_uuid_unparse_lower(uuid, uuid_str);
-            mtev_logic_var_set_string_copy(out, uuid_str);
-            return mtev_true;
-          case mtev_Value_StringValue:
-            mtev_logic_var_set_string(out, mtev_StringValue_value(mtev_KVPair_value(kv)));
-            return mtev_true;
-          case mtev_Value_LongValue:
-            mtev_logic_var_set_int64(out, mtev_LongValue_value(mtev_KVPair_value(kv)));
-            return mtev_true;
-          case mtev_Value_ULongValue:
-            v = mtev_ULongValue_value(mtev_KVPair_value(kv));
-            if(v <= INT64_MAX) mtev_logic_var_set_int64(out, v);
-            else mtev_logic_var_set_double(out, (double)v);
-            return mtev_true;
-          case mtev_Value_DoubleValue:
-            mtev_logic_var_set_double(out, mtev_DoubleValue_value(mtev_KVPair_value(kv)));
-            return mtev_true;
-          default:
-            break;
-        }
-        return mtev_false;
-      }
-    }
-  }
-  return mtev_false;
-}
-static mtev_logic_ops_t flatbuffer_log_filter_ops = {
-  .lookup = flatbuffer_log_logic_lookup
-};
-
 static int
 mtev_log_line(mtev_log_stream_t ls, mtev_log_stream_t bitor,
               const void *fbuffer, size_t flen) {
@@ -2225,6 +2255,7 @@ mtev_log_line(mtev_log_stream_t ls, mtev_log_stream_t bitor,
       }
     }
   }
+  ck_rwlock_recursive_read_lock(&outlets_lock);
   for(node = ls->outlets; node; node = node->next) {
     int srv = 0;
     debug_printf(" %s -> %s\n", ls->name, node->outlet->name);
@@ -2232,10 +2263,12 @@ mtev_log_line(mtev_log_stream_t ls, mtev_log_stream_t bitor,
     if(IS_ENABLED_ON(node->outlet) && IS_ENABLED_BELOW(node->outlet)) {
       if(node->filter && !ll) {
         if(0 != mtev_LogLine_verify_as_root(fbuffer, flen)) {
+          ck_rwlock_recursive_read_unlock(&outlets_lock);
           return 0;
         }
         ll = mtev_LogLine_as_root(fbuffer);
         if(ll == NULL) {
+          ck_rwlock_recursive_read_unlock(&outlets_lock);
           return 0;
         }
       }
@@ -2245,6 +2278,7 @@ mtev_log_line(mtev_log_stream_t ls, mtev_log_stream_t bitor,
     }
     if(srv) rv = srv;
   }
+  ck_rwlock_recursive_read_unlock(&outlets_lock);
   return rv;
 }
 
@@ -2256,9 +2290,102 @@ mtev_vlog(mtev_log_stream_t ls, const struct timeval *now,
       (mtev_log_kv_t *[]){ &(mtev_log_kv_t){ NULL, 0, .value = { .v_string = NULL } } },
       format, arg);
 }
-static unsigned char sigbuff[32*1024];
-static size_t sigbuff_used = 0;
-static int sig_fb_alloc(void *alloc_context, flatcc_iovec_t *b, size_t request, int zero_fill, int alloc_type) {
+
+/* flatbuffers construction can alloc a lot, this is problematic for both
+ * performance and the fact that we may be called in a signal handler and
+ * cannot alloc.
+ *
+ * The `struct thr_buff` helps us with that.
+ */
+struct thr_buff_overflow {
+  struct thr_buff_overflow *next;
+  size_t len;
+  unsigned char usable[1];
+};
+
+struct thr_buff {
+  unsigned char *buffer;
+  size_t buffer_size;
+  size_t buffer_used;
+  struct thr_buff_overflow *alist;
+};
+
+static void *thr_buff_overflow_alloc(struct thr_buff *parent, size_t len) {
+  len--;
+  len |= len >> 1;
+  len |= len >> 2;
+  len |= len >> 4;
+  len |= len >> 8;
+  len |= len >> 16;
+  len |= len >> 32;
+  len++;
+  struct thr_buff_overflow *node = malloc(offsetof(struct thr_buff_overflow, usable) + len);
+  node->next = parent->alist;
+  node->len = len;
+  parent->alist = node;
+  return node->usable;
+}
+
+static void thr_buff_free(void *v) {
+  struct thr_buff *b = v;
+  if(b && b->buffer) free(b->buffer);
+  while(b->alist) {
+    struct thr_buff_overflow *tofree = b->alist;
+    b->alist = b->alist->next;
+    free(tofree);
+  }
+  free(v);
+}
+
+static __thread struct thr_buff *my_thr_buff;
+static pthread_key_t my_thr_buff_key;
+
+static void thr_buff_reset(struct thr_buff *b) {
+  b->buffer_used = 0;
+  size_t extra = 0;
+  while(b->alist) {
+    struct thr_buff_overflow *tofree = b->alist;
+    b->alist = b->alist->next;
+    extra += tofree->len;
+    free(tofree);
+  }
+  if(extra) {
+    unsigned char *nbuff = malloc(b->buffer_size + extra);
+    if(nbuff) {
+      free(b->buffer);
+      b->buffer = nbuff;
+      b->buffer_size += extra;
+    }
+  }
+}
+
+static struct thr_buff *local_thr_buff_get(void) {
+  static unsigned char _sigbuff[32*1024];
+  static struct thr_buff sigbuff = { .buffer = _sigbuff, .buffer_size = sizeof(_sigbuff) };
+
+  /* If we're in a signal handler, no TLS and no allocations */
+  if(_mtev_log_siglvl != 0) return &sigbuff;
+
+  if(!my_thr_buff) {
+    my_thr_buff = pthread_getspecific(my_thr_buff_key);
+    if(!my_thr_buff) {
+      my_thr_buff = calloc(1, sizeof(*my_thr_buff));
+      my_thr_buff->buffer = malloc(1024);
+      if(my_thr_buff->buffer) {
+        my_thr_buff->buffer_size = 1024;
+      }
+    }
+    pthread_setspecific(my_thr_buff_key, my_thr_buff);
+  }
+  assert(my_thr_buff);
+  return my_thr_buff;
+}
+
+
+static int local_thr_buff_alloc(void *alloc_context, flatcc_iovec_t *b,
+                                size_t request, int zero_fill, int alloc_type) {
+  struct thr_buff *src = alloc_context;
+  if(!src) return 0;
   if(request == 0) {
     b->iov_base = 0;
     b->iov_len = 0;
@@ -2273,15 +2400,29 @@ static int sig_fb_alloc(void *alloc_context, flatcc_iovec_t *b, size_t request, 
   request |= request >> 32;
   request++;
   if(b->iov_len < request) {
-    if(sigbuff_used + request > sizeof(sigbuff)) return -1;
-    if(b->iov_len) memcpy(sigbuff+sigbuff_used, b->iov_base, b->iov_len);
-    if(zero_fill) memset(sigbuff+sigbuff_used + b->iov_len, 0, request - b->iov_len);
-    b->iov_base = sigbuff+sigbuff_used;
+    void *ob = NULL;
+    if(src->buffer_used + request > src->buffer_size) {
+      if(_mtev_log_siglvl == 0) {
+        ob = thr_buff_overflow_alloc(src, request);
+      }
+      if(ob == NULL) {
+        return -1;
+      }
+      fprintf(stderr, "local_thr_buff_alloc(%p) [%zu + %zu > %zu]\n",
+              src, src->buffer_used, request, src->buffer_size);
+    }
+    else {
+      ob = src->buffer + src->buffer_used;
+      src->buffer_used += request;
+    }
+    if(b->iov_len) memcpy(ob, b->iov_base, b->iov_len);
+    if(zero_fill) memset(ob + b->iov_len, 0, request - b->iov_len);
+    b->iov_base = ob;
     b->iov_len = request;
-    sigbuff_used += request;
   }
   return 0;
 }
+
 int
 mtev_ex_vlog(mtev_log_stream_t ls, const struct timeval *now,
              const char *file, int line,
@@ -2290,6 +2431,7 @@ mtev_ex_vlog(mtev_log_stream_t ls, const struct timeval *now,
   int rv = 0, allocd = 0;
   /* All paths lead to here and recursion would be very very bad */
   if(recursion_block) return 0;
+  struct thr_buff *local_thr_buff = local_thr_buff_get();
   recursion_block = 1;
   MTEV_MAYBE_DECL(char, buffer, 4096);
   struct timeval __now;
@@ -2317,11 +2459,7 @@ mtev_ex_vlog(mtev_log_stream_t ls, const struct timeval *now,
     int len;
     flatcc_builder_t builder, *B = &builder;
 
-    if(_mtev_log_siglvl == 0) {
-      flatcc_builder_init(B);
-    } else {
-      flatcc_builder_custom_init(B, 0, 0, &sig_fb_alloc, NULL);
-    }
+    flatcc_builder_custom_init(B, 0, 0, &local_thr_buff_alloc, local_thr_buff);
     mtev_LogLine_start_as_root(B);
     ENSURE_NOW();
     mtev_LogLine_timestamp_add(B, (uint64_t)now->tv_sec * 1000000 + now->tv_usec);
@@ -2447,7 +2585,7 @@ mtev_ex_vlog(mtev_log_stream_t ls, const struct timeval *now,
       if(tofree) flatcc_builder_aligned_free(tofree);
     }
     flatcc_builder_clear(B);
-    sigbuff_used = 0;
+    thr_buff_reset(local_thr_buff);
     MTEV_MAYBE_FREE(buffer);
     errno = old_errno;
     recursion_block = 0;
@@ -2839,10 +2977,12 @@ mtev_log_init_globals(void) {
     pthread_mutex_init(&resize_lock, &attr);
     pthread_mutex_init(&logpipes_lock, NULL);
 
+    mtevAssert(pthread_key_create(&my_thr_buff_key, thr_buff_free) == 0);
+
     mtev_hash_init_locks(&mtev_loggers, MTEV_HASH_DEFAULT_SIZE, MTEV_HASH_LOCK_MODE_MUTEX);
     mtev_hash_init_locks(&mtev_logops, MTEV_HASH_DEFAULT_SIZE, MTEV_HASH_LOCK_MODE_MUTEX);
 
-    filter_runtime = mtev_logic_exec_alloc(&flatbuffer_log_filter_ops);
+    if(!filter_runtime) filter_runtime = mtev_logic_exec_alloc(&flatbuffer_log_filter_ops);
 
     mtev_stats_init();
     stats_ns_t *mtev_log_stats_ns = mtev_stats_ns(mtev_stats_ns(NULL, "mtev"), "log");
