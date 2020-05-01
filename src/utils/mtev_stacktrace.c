@@ -83,7 +83,7 @@ static mtev_boolean (*global_file_filter)(const char *);
 static mtev_boolean (*global_file_symbol_filter)(const char *);
 static mtev_boolean mtev_dwarf_disabled = mtev_false;
 
-typedef enum { NOT_SET, ADDR_MAP_LINE, ADDR_MAP_FUNCTION } addr_map_type_t;
+typedef enum { NOT_SET, ADDR_MAP_LINE, ADDR_MAP_FUNCTION, ADDR_MAP_VAR } addr_map_type_t;
 
 struct addr_map {
   uintptr_t addr;
@@ -130,12 +130,32 @@ struct typenode {
   size_t size;
   struct typenode *resolved;
 };
+
+static inline const char *type_name(struct typenode *t, char *buff, size_t len) {
+  if(t->resolved != t) type_name(t->resolved, buff, len);
+  switch(t->tag) {
+    case DW_TAG_pointer_type: strlcat(buff, " *", len); break;
+    case DW_TAG_typedef: break;
+    case DW_TAG_const_type: strlcat(buff, " const", len); break;
+    case DW_TAG_restrict_type: strlcat(buff, " restrict", len); break;
+    case DW_TAG_reference_type: strlcat(buff, " &", len); break;
+    case DW_TAG_structure_type: strlcat(buff, "struct ", len); strlcat(buff, t->name, len); break;
+    case DW_TAG_union_type: strlcat(buff, "union ", len); strlcat(buff, t->name, len); break;
+    case DW_TAG_enumeration_type: strlcat(buff, "enum ", len); strlcat(buff, t->name, len); break;
+    case DW_TAG_base_type: strlcat(buff, t->name, len); break;
+    default:
+      strlcat(buff, t->name, len);
+      break;
+  }
+  return buff;
+}
 struct symnode {
   uintptr_t low, high;
-  Dwarf_Off type;
+  struct typenode *type;
   char *name;
 };
 static mtev_skiplist *symtable;
+static mtev_hash_table *vartable;
 
 static void
 dw_mtev_log(Dwarf_Error err, Dwarf_Ptr closure) {
@@ -257,32 +277,45 @@ const char *mtev_function_name(uintptr_t addr) {
   }
   return NULL;
 }
-static struct typenode *cache_type(struct dmap_node *node, Dwarf_Off off) {
-  const char *tag_name = "unknown";
-  char *die_name;
+static struct typenode *cache_type(struct dmap_node *node, Dwarf_Off off, const char *ref) {
+  (void)ref;
+  const char *typename = NULL;
+  char *die_name = "";
   Dwarf_Die die = 0;
   Dwarf_Error err;
   Dwarf_Attribute attr;
+  void *vptr = NULL;
 
   if(dwarf_offdie(node->dbg, off, &die, &err) == DW_DLV_OK) {
-    Dwarf_Half tag;
-    if(dwarf_diename(die, &die_name, &err) == DW_DLV_OK &&
-       dwarf_tag(die, &tag, &err) == DW_DLV_OK &&
-       dwarf_get_TAG_name(tag, &tag_name) == DW_DLV_OK) {
-      void *vptr;
-      if(!mtev_hash_retrieve(&node->types, (const char *)&off, sizeof(off), &vptr)) {
+    if(!mtev_hash_retrieve(&node->types, (const char *)&off, sizeof(off), &vptr)) {
+      Dwarf_Half tag, theform;
+      if(dwarf_attr(die, DW_AT_name, &attr, &err) == DW_DLV_OK) {
+        char *temps = NULL;
+        if(dwarf_whatform(attr, &theform, &err) == DW_DLV_OK) {
+          switch(theform) {
+            case DW_FORM_strp:
+              if(dwarf_formstring(attr, &temps, &err) == DW_DLV_OK) typename = temps;
+              break;
+          }
+        }
+      }
+      if(!typename) {
+        if(dwarf_diename(die, &die_name, &err) == DW_DLV_OK) {
+          typename = die_name;
+        }
+      }
+      if(!typename) typename = "<unknown>";
+      if(dwarf_tag(die, &tag, &err) == DW_DLV_OK) {
         struct typenode *n = calloc(1, sizeof(*n));
         n->id = off;
         mtev_hash_replace(&node->types, (const char *)&n->id, sizeof(n->id), n, NULL, free);
         n->tag = tag;
-        n->name = strdup(die_name);
+        n->name = strdup(typename);
         n->resolved = n;
-        if(n->tag == DW_TAG_typedef) {
-          if(dwarf_attr(die, DW_AT_type, &attr, &err) == DW_DLV_OK) {
-            Dwarf_Off off;
-            dwarf_global_formref(attr, &off, &err);
-            n->resolved = cache_type(node, off);
-          }
+        if(dwarf_attr(die, DW_AT_type, &attr, &err) == DW_DLV_OK) {
+          Dwarf_Off off;
+          dwarf_global_formref(attr, &off, &err);
+          n->resolved = cache_type(node, off, typename);
         }
         if(dwarf_attr(die, DW_AT_byte_size, &attr, &err) == DW_DLV_OK) {
           Dwarf_Unsigned size;
@@ -291,10 +324,9 @@ static struct typenode *cache_type(struct dmap_node *node, Dwarf_Off off) {
         }
         vptr = n;
       }
-      return vptr;
     }
   }
-  return NULL;
+  return vptr;
 }
 static int extract_symbols(struct dmap_node *node, Dwarf_Die sib) {
   int symbols = 0;
@@ -326,6 +358,8 @@ static int extract_symbols(struct dmap_node *node, Dwarf_Die sib) {
     Dwarf_Bool flag;
     struct symnode n = { .low = 0 };
 
+    if(dwarf_attr(sib, DW_AT_location, &attr, &err) != DW_DLV_OK) return symbols;
+
     switch(tag) {
       case DW_TAG_variable:
         if(dwarf_attr(sib, DW_AT_external, &attr, &err) != DW_DLV_OK ||
@@ -340,11 +374,10 @@ static int extract_symbols(struct dmap_node *node, Dwarf_Die sib) {
             if(dwarf_whatattr(attrs[i], &attrcode, &err) == DW_DLV_OK) {
               if (attrcode == DW_AT_type) {
                 dwarf_global_formref(attrs[i], &off, &err);
-                n.type = off;
-                struct typenode *t = cache_type(node, off);
+                struct typenode *t = cache_type(node, off, die_name);
                 if(t) {
-                  while(t->resolved && t->resolved != t) t = t->resolved;
                   n.high = n.low + t->size;
+                  n.type = t;
                 }
               } else if(attrcode == DW_AT_low_pc) {
                 dwarf_formaddr(attrs[i], &pc, &err);
@@ -368,24 +401,33 @@ static int extract_symbols(struct dmap_node *node, Dwarf_Die sib) {
             }
           }
           if(n.low) {
-            mtevL(maint_dwarf_log, "found symbol: %llu:%s, %p-%p\n", n.type, die_name, (void *)n.low,
+            mtevL(maint_dwarf_log, "found symbol: %s:%s, %p-%p\n",
+                  n.type ? n.type->name : "unknown", die_name, (void *)n.low,
                   (void *)n.high);
             symbols++;
             struct addr_map *head = calloc(1, sizeof(struct addr_map));
             head->addr = n.low - node->base;
-            head->type = ADDR_MAP_FUNCTION;
+            head->type = tag == DW_TAG_variable ? ADDR_MAP_VAR : ADDR_MAP_FUNCTION;
             head->file_or_fn = strdup(die_name);
             head->next = node->addr_map;
             node->addr_map = head;
-            if(n.high) {
+            if(n.high && (tag != DW_TAG_variable || (n.type && n.type->size))) {
               struct symnode *copy = malloc(sizeof(*copy));
               copy->name = strdup(die_name);
               copy->low = n.low;
               copy->high = n.high;
               copy->type = n.type;
-              if (mtev_skiplist_insert(symtable, copy) == NULL) {
-                free(copy->name);
-                free(copy);
+              if (head->type == ADDR_MAP_VAR) {
+                if(!mtev_hash_store(vartable, copy->name, strlen(copy->name), copy)) {
+                  free(copy->name);
+                  free(copy);
+                }
+              }
+              else {
+                if (mtev_skiplist_insert(symtable, copy) == NULL) {
+                  free(copy->name);
+                  free(copy);
+                }
               }
             }
           }
@@ -576,12 +618,24 @@ mtev_dwarf_refresh(void) {
 #else
   maint_dwarf_log = NULL;
 #endif
+  if(!vartable) {
+    vartable = calloc(1, sizeof(*vartable));
+    mtev_hash_init(vartable);
+  }
   if(!symtable) {
     mtev_skiplist *st = mtev_skiplist_alloc();
     mtev_skiplist_set_compare(st, loc_comp, loc_comp_key);
     symtable = st;
   }
   mtev_dwarf_walk_map(mtev_dwarf_refresh_file);
+  mtevL(mtev_error, "variables -> %d\n", mtev_hash_size(vartable));
+  mtev_hash_iter iter = MTEV_HASH_ITER_ZERO;
+  while(mtev_hash_adv(vartable, &iter)) {
+    struct symnode *sym = iter.value.ptr;
+    char scratch[40];
+    scratch[0] = '\0';
+    mtevL(mtev_error, "[%s] [%s] @ %zx[+%zu]\n", sym->type ? type_name(sym->type,scratch,sizeof(scratch)) : "unknown", iter.key.str, sym->low, sym->high - sym->low);
+  }
 #else
   return;
 #endif

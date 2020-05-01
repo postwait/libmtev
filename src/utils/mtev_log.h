@@ -46,13 +46,7 @@
 #include "mtev_json.h"
 #include "mtev_zipkin.h"
 
-#ifdef mtev_log_impl
-typedef struct _mtev_log_stream mtev_log_stream_t;
-#define mtev_log_stream_t mtev_log_stream_t *
-#else
-typedef void * mtev_log_stream_public_t;
-#define mtev_log_stream_t mtev_log_stream_public_t
-#endif
+typedef struct _mtev_log_stream *mtev_log_stream_t;
 typedef struct mtev_log_stream_pipe mtev_log_stream_pipe_t;
 
 #define MTEV_LOG_DEFAULT_DEDUP_S 5
